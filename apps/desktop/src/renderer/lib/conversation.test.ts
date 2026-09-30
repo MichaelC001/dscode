@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyAgentEvent, getAssistantActivity, groupConversation, normalizeMessages, optimisticUserMessage, splitAssistantTurn } from "./conversation";
+import { appendConversationError, applyAgentEvent, getAssistantActivity, groupConversation, normalizeMessages, optimisticUserMessage, splitAssistantTurn } from "./conversation";
 
 describe("conversation events", () => {
   it("normalizes assistant text, thinking, and tool calls", () => {
@@ -37,6 +37,36 @@ describe("conversation events", () => {
       { type: "tool", id: "tool-tool-1", toolId: "tool-1" },
       { type: "text", id: "text-2", text: "Done." },
     ]);
+  });
+
+  it("surfaces an assistant error even when the response has no content", () => {
+    const messages = normalizeMessages([{
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "401 Authentication Fails: invalid API key",
+    }]);
+
+    expect(messages[0]).toMatchObject({
+      role: "assistant",
+      text: "",
+      error: "401 Authentication Fails: invalid API key",
+    });
+    expect(splitAssistantTurn(messages).responses).toEqual([{
+      key: "history-0:error",
+      text: "401 Authentication Fails: invalid API key",
+      error: true,
+      streaming: false,
+    }]);
+  });
+
+  it("appends runtime errors to the conversation without duplicating repeated reports", () => {
+    const once = appendConversationError([], "Agent stopped\nProvider unavailable");
+    const twice = appendConversationError(once, "Agent stopped\nProvider unavailable");
+
+    expect(once).toHaveLength(1);
+    expect(once[0]).toMatchObject({ role: "assistant", error: "Agent stopped\nProvider unavailable" });
+    expect(twice).toBe(once);
   });
 
   it("deduplicates optimistic user messages and streams one assistant message", () => {

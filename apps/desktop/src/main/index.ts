@@ -32,6 +32,7 @@ import type { AuthInteraction, AuthPrompt } from "@thinkany/dscode-core";
 import { AgentHost } from "./agent-host";
 import { RecentWorkspaces } from "./recent-workspaces";
 import { AppSettings } from "./app-settings";
+import { configureDesktopStorage } from "./storage";
 import { listCodexThemes } from "./themes";
 import {
   archiveSession,
@@ -60,10 +61,10 @@ let activePreviewId: string | undefined;
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const developmentIconPath = path.join(currentDirectory, "../../build/icon-dev.png");
 const legacyUserDataPath = app.getPath("userData");
-const userDataOverride = process.env.DSCODE_DESKTOP_USER_DATA;
-const stableUserDataPath = userDataOverride
-  ? path.resolve(userDataOverride)
-  : path.join(app.getPath("appData"), "DSCode");
+const { userDataPath: stableUserDataPath, migrateLegacyData } = configureDesktopStorage(
+  app.isPackaged,
+  app.getPath("appData"),
+);
 const generalTasksPath = path.join(stableUserDataPath, "tasks");
 const appSettingsFile = path.join(stableUserDataPath, "app-settings.json");
 
@@ -72,17 +73,14 @@ protocol.registerSchemesAsPrivileged([{
   privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
 }]);
 
-app.setName("DSCode");
+app.setName(app.isPackaged ? "DSCode" : "DSCode Dev");
 fs.mkdirSync(stableUserDataPath, { recursive: true, mode: 0o700 });
 fs.mkdirSync(generalTasksPath, { recursive: true, mode: 0o700 });
 app.setPath("userData", stableUserDataPath);
-if (userDataOverride) {
-  const logs = path.join(stableUserDataPath, "logs");
-  fs.mkdirSync(logs, { recursive: true, mode: 0o700 });
-  app.setAppLogsPath(logs);
-} else {
-  app.setAppLogsPath();
-}
+app.setPath("sessionData", stableUserDataPath);
+const logs = path.join(stableUserDataPath, "logs");
+fs.mkdirSync(logs, { recursive: true, mode: 0o700 });
+app.setAppLogsPath(logs);
 
 function createWindow(): void {
   const { workArea } = screen.getPrimaryDisplay();
@@ -416,7 +414,7 @@ app.on("before-quit", () => {
 });
 
 async function migrateDesktopData(): Promise<void> {
-  if (legacyUserDataPath === stableUserDataPath) return;
+  if (!migrateLegacyData || legacyUserDataPath === stableUserDataPath) return;
   const source = path.join(legacyUserDataPath, "recent-workspaces.json");
   const target = path.join(stableUserDataPath, "recent-workspaces.json");
   try {

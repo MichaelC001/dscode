@@ -26,6 +26,7 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
+  error?: string;
   thinking?: string;
   timestamp?: number;
   streaming?: boolean;
@@ -48,6 +49,7 @@ export interface TurnWorkEntry {
 export interface TurnResponseEntry {
   key: string;
   text: string;
+  error: boolean;
   streaming: boolean;
 }
 
@@ -102,7 +104,7 @@ export function splitAssistantTurn(messages: ChatMessage[], active = false): { w
     for (const item of message.work) {
       const key = `${message.id}:${item.id}`;
       if (!active && item.type === "text" && messageIndex > lastToolMessageIndex) {
-        responses.push({ key, text: item.text, streaming: Boolean(message.streaming) });
+        responses.push({ key, text: item.text, error: false, streaming: Boolean(message.streaming) });
       } else {
         work.push({ key, message, item });
       }
@@ -111,10 +113,19 @@ export function splitAssistantTurn(messages: ChatMessage[], active = false): { w
     if (textItems.length === 0 && message.text.trim()) {
       const key = `${message.id}:fallback-text`;
       if (!active && messageIndex > lastToolMessageIndex) {
-        responses.push({ key, text: message.text, streaming: Boolean(message.streaming) });
+        responses.push({ key, text: message.text, error: false, streaming: Boolean(message.streaming) });
       } else {
         work.push({ key, message, item: { type: "text", id: "fallback-text", text: message.text } });
       }
+    }
+
+    if (message.error) {
+      responses.push({
+        key: `${message.id}:error`,
+        text: message.error,
+        error: true,
+        streaming: false,
+      });
     }
   });
   responses.forEach((response, index) => {
@@ -204,6 +215,25 @@ export function optimisticUserMessage(text: string, queued = false, images: Chat
   };
 }
 
+export function appendConversationError(messages: ChatMessage[], error: string): ChatMessage[] {
+  const message = crop(error.trim(), 12_000);
+  if (!message) return messages;
+  const duplicate = messages.slice(-3).some((candidate) =>
+    candidate.role === "assistant" && candidate.error === message,
+  );
+  if (duplicate) return messages;
+  return [...messages, {
+    id: `error-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    role: "assistant",
+    text: "",
+    error: message,
+    timestamp: Date.now(),
+    images: [],
+    tools: [],
+    work: [],
+  }];
+}
+
 export function getMessageText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -218,6 +248,9 @@ function messageFromRecord(value: JsonRecord, id: string): ChatMessage | undefin
   if (value.role !== "user" && value.role !== "assistant") return undefined;
   const content = value.content;
   const text = getMessageText(content);
+  const error = value.role === "assistant" && typeof value.errorMessage === "string"
+    ? value.errorMessage.trim()
+    : "";
   const thinking = getThinking(content);
   const images = getImages(content);
   const timestamp = normalizeTimestamp(value.timestamp);
@@ -227,6 +260,7 @@ function messageFromRecord(value: JsonRecord, id: string): ChatMessage | undefin
     id,
     role: value.role,
     text,
+    ...(error ? { error } : {}),
     images,
     ...(thinking ? { thinking } : {}),
     ...(timestamp !== undefined ? { timestamp } : {}),

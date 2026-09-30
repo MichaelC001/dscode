@@ -33,6 +33,7 @@ import {
   GitBranch,
   GitFork,
   Globe2,
+  History,
   ImagePlus,
   Info,
   Languages,
@@ -75,6 +76,7 @@ import type {
 } from "../shared/types";
 import { AUTH_PROMPT_CANCEL_VALUE } from "../shared/types";
 import {
+  appendConversationError,
   applyAgentEvent,
   getAssistantActivity,
   groupConversation,
@@ -88,10 +90,17 @@ import {
 } from "./lib/conversation";
 import { applyTheme } from "./lib/theme";
 import { localizeExtensionUiRequest, useI18n } from "./lib/i18n";
-import { isAgentSessionClosedError, isAuthPromptCancelledError } from "./lib/errors";
+import { isAgentSessionClosedError, isAuthPromptCancelledError, isModelConfigurationError } from "./lib/errors";
 import { isPreviewPathInWorkspace, previewPathsFromText } from "./lib/file-preview";
+import { stabilizeMarkdownAutolinks } from "./lib/markdown";
 import { parseStructuredPlan, type StructuredPlan } from "./lib/plan";
 import { updateConversationTailFollowing } from "./lib/conversation-scroll";
+import {
+  groupWorkTimeline,
+  recentWorkTimeline,
+  type ResolvedToolEntry,
+  type ToolKind,
+} from "./lib/work-log";
 
 interface Attachment extends ChatImage {
   name: string;
@@ -101,7 +110,11 @@ interface PreviewImage extends ChatImage {
   alt: string;
 }
 
+type SettingsSection = "general" | "personalization" | "models" | "agent" | "appearance" | "about";
+
 const PROJECT_TASK_PREVIEW_COUNT = 4;
+const WORK_LOG_COMPACT_THRESHOLD = 12;
+const WORK_LOG_RECENT_ITEM_COUNT = 8;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const DSCODE_WEBSITE_URL = "https://dscode.ai?utm_source=dscode_desktop";
 const DSCODE_GITHUB_URL = "https://github.com/thinkany-ai/dscode";
@@ -136,7 +149,7 @@ function inspectorBoundsForLayout(layoutWidth: number) {
 }
 
 export default function App() {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const [workspace, setWorkspace] = useState<string>();
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
@@ -174,6 +187,7 @@ export default function App() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string>();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>("general");
   const [commandOpen, setCommandOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -287,6 +301,7 @@ export default function App() {
       setPreviewLoading(false);
     }
     if (providerStatuses.length && !status?.configured) {
+      setSettingsInitialSection("models");
       setSettingsOpen(true);
       setToast({ message: t("status.connectProvider", { provider: status?.name ?? nextProvider }), type: "error" });
       return false;
@@ -310,9 +325,12 @@ export default function App() {
     } catch (error) {
       if (isAgentSessionClosedError(error)) return false;
       const message = error instanceof Error ? error.message : String(error);
-      if (!background) setMessages([]);
+      if (!background) setMessages(() => appendConversationError([], conversationError(message)));
       setToast({ message: cleanError(message), type: "error" });
-      if (/not configured|credential|login|api key/i.test(message)) setSettingsOpen(true);
+      if (isModelConfigurationError(message)) {
+        setSettingsInitialSection("models");
+        setSettingsOpen(true);
+      }
       return false;
     } finally {
       if (!background) setLoading(false);
@@ -371,7 +389,9 @@ export default function App() {
           if (!cancelled) hydrateSnapshot(snapshot);
         } catch (error) {
           if (!cancelled && !isAgentSessionClosedError(error)) {
-            setToast({ message: cleanError(error instanceof Error ? error.message : String(error)), type: "error" });
+            const message = error instanceof Error ? error.message : String(error);
+            setMessages((current) => appendConversationError(current, conversationError(message)));
+            setToast({ message: cleanError(message), type: "error" });
           }
         }
       }
@@ -394,7 +414,11 @@ export default function App() {
       if (event.type === "extension_ui_request") {
         const request = event as ExtensionUiRequest;
         if (request.method === "notify") {
-          setToast({ message: request.message ?? t("app.notification"), type: request.notifyType === "error" ? "error" : "info" });
+          const message = request.message ?? t("app.notification");
+          if (request.notifyType === "error") {
+            setMessages((current) => appendConversationError(current, conversationError(message)));
+          }
+          setToast({ message, type: request.notifyType === "error" ? "error" : "info" });
         } else if (["select", "confirm", "input", "editor"].includes(request.method)) {
           setUiRequest(request);
         }
@@ -405,6 +429,7 @@ export default function App() {
       if (isAgentSessionClosedError(message)) return;
       setRunning(false);
       setUiRequest(undefined);
+      setMessages((current) => appendConversationError(current, conversationError(message)));
       setToast({ message: cleanError(message), type: "error" });
     });
     const offAuth = window.dscode.auth.onEvent((event) => {
@@ -568,7 +593,9 @@ export default function App() {
         return;
       }
       setRunning(alreadyRunning);
-      setToast({ message: cleanError(error instanceof Error ? error.message : String(error)), type: "error" });
+      const message = error instanceof Error ? error.message : String(error);
+      setMessages((current) => appendConversationError(current, conversationError(message)));
+      setToast({ message: cleanError(message), type: "error" });
     }
   };
 
@@ -702,8 +729,10 @@ export default function App() {
   const conversationGroups = useMemo(() => groupConversation(messages), [messages]);
   const latestAssistantGroup = [...conversationGroups].reverse().find((group) => group.type === "assistant");
   const activeAssistantGroupId = running ? latestAssistantGroup?.id : undefined;
-  const activeAssistantHasWork = latestAssistantGroup?.type === "assistant"
-    && splitAssistantTurn(latestAssistantGroup.messages, running).work.length > 0;
+  const activeAssistantTurn = latestAssistantGroup?.type === "assistant"
+    ? splitAssistantTurn(latestAssistantGroup.messages, running)
+    : undefined;
+  const activeAssistantHasContent = Boolean(activeAssistantTurn?.work.length || activeAssistantTurn?.responses.length);
   const projectPaths = useMemo(() => new Set(workspaces.map((item) => item.path)), [workspaces]);
 
   const showPreviewPanel = () => {
@@ -883,7 +912,7 @@ export default function App() {
                 className={`thread-row recent-task-row ${session.path === activeSession ? "active" : ""}`}
                 onClick={() => void openSession(session)}
               >
-                <span className="thread-copy"><strong>{session.title}</strong><small>{relativeTime(session.updatedAt, locale, t("status.now"))}</small></span>
+                <span className="thread-copy"><strong>{session.title}</strong></span>
                 <span className="task-dot" aria-hidden="true" />
               </button>
             ))}
@@ -972,9 +1001,13 @@ export default function App() {
                           active={group.id === activeAssistantGroupId}
                           showReasoningProcess={showReasoningProcess}
                           onPreviewFile={(filePath) => void openFilePreview(filePath)}
+                          onConfigureModel={() => {
+                            setSettingsInitialSection("models");
+                            setSettingsOpen(true);
+                          }}
                         />
                   ))}
-                  {running && !uiRequest && !activeAssistantHasWork && (
+                  {running && !uiRequest && !activeAssistantHasContent && (
                     <div className="work-log active" role="status" aria-live="polite">
                       <div className="work-log-summary work-log-status">
                         <LoaderCircle className="spin work-log-spinner" size={14} aria-hidden="true" />
@@ -987,7 +1020,10 @@ export default function App() {
                       key={uiRequest.id}
                       request={uiRequest}
                       onDone={() => setUiRequest(undefined)}
-                      onError={(message) => setToast({ message, type: "error" })}
+                      onError={(message) => {
+                        setMessages((current) => appendConversationError(current, conversationError(message)));
+                        setToast({ message, type: "error" });
+                      }}
                     />
                   )}
                 </div>
@@ -1121,6 +1157,7 @@ export default function App() {
 
       {settingsOpen && (
         <SettingsDialog
+          initialSection={settingsInitialSection}
           providers={providers}
           provider={provider}
           permission={permission}
@@ -1130,7 +1167,10 @@ export default function App() {
           profile={profile}
           showReasoningProcess={showReasoningProcess}
           personalization={personalization}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsInitialSection("general");
+          }}
           onRefresh={async () => setProviders(await window.dscode.auth.status())}
           onConnected={async (value) => {
             const nextProviders = await window.dscode.auth.status();
@@ -1378,12 +1418,15 @@ function AssistantTurn({
   active,
   showReasoningProcess,
   onPreviewFile,
+  onConfigureModel,
 }: {
   messages: ChatMessage[];
   active: boolean;
   showReasoningProcess: boolean;
   onPreviewFile(filePath: string): void;
+  onConfigureModel(): void;
 }) {
+  const { t } = useI18n();
   const { work, responses } = splitAssistantTurn(messages, active);
 
   return (
@@ -1397,12 +1440,38 @@ function AssistantTurn({
           onPreviewFile={onPreviewFile}
         />
       )}
-      {responses.map((response) => (
-        <div className="assistant-response" key={response.key}>
-          <MarkdownContent text={response.text} onPreviewFile={onPreviewFile} />
-          {response.streaming && <span className="stream-cursor" />}
-        </div>
-      ))}
+      {responses.map((response) => {
+        if (!response.error) return (
+          <div className="assistant-response" key={response.key}>
+            <MarkdownContent text={response.text} onPreviewFile={onPreviewFile} />
+            {response.streaming && <span className="stream-cursor" />}
+          </div>
+        );
+        const configurationError = isModelConfigurationError(response.text);
+        return (
+          <div className={`assistant-error${configurationError ? " configuration-error" : ""}`} role="alert" key={response.key}>
+            <span className="assistant-error-icon"><CircleAlert size={15} aria-hidden="true" /></span>
+            <div className="assistant-error-copy">
+              <strong>{t(configurationError ? "conversation.modelConfigurationError" : "conversation.requestFailed")}</strong>
+              {configurationError
+                ? <>
+                    <p>{t("conversation.modelConfigurationDescription")}</p>
+                    <div className="assistant-error-actions">
+                      <button type="button" className="assistant-error-action" onClick={onConfigureModel}>
+                        <Settings size={13} aria-hidden="true" />
+                        <span>{t("conversation.configureModel")}</span>
+                      </button>
+                    </div>
+                    <details className="assistant-error-details">
+                      <summary>{t("conversation.errorDetails")}</summary>
+                      <pre>{response.text}</pre>
+                    </details>
+                  </>
+                : <div className="assistant-error-message">{response.text}</div>}
+            </div>
+          </div>
+        );
+      })}
     </article>
   );
 }
@@ -1418,7 +1487,7 @@ function MarkdownContent({ text, className = "markdown-body", onPreviewFile }: {
             : <a href={href} target="_blank" rel="noreferrer">{children}</a>;
         },
         code: ({ children, className: codeClassName }) => <code className={codeClassName}>{children}</code>,
-      }}>{text}</ReactMarkdown>
+      }}>{stabilizeMarkdownAutolinks(text)}</ReactMarkdown>
     </div>
   );
 }
@@ -1440,8 +1509,15 @@ function WorkLog({
   const failed = messages.some((message) => message.tools.some((tool) => tool.status === "error"));
   const activity = getAssistantActivity(messages);
   const [open, setOpen] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const [now, setNow] = useState(Date.now());
   const expanded = active || open;
+  const canCompact = timeline.length > WORK_LOG_COMPACT_THRESHOLD;
+  const visibleTimeline = canCompact && !showAll
+    ? recentWorkTimeline(timeline, WORK_LOG_RECENT_ITEM_COUNT)
+    : timeline;
+  const hiddenCount = timeline.length - visibleTimeline.length;
+  const displayTimeline = groupWorkTimeline(visibleTimeline);
 
   useEffect(() => {
     if (!active) return;
@@ -1457,7 +1533,13 @@ function WorkLog({
         className="work-log-summary"
         aria-expanded={expanded}
         aria-disabled={active}
-        onClick={() => { if (!active) setOpen((value) => !value); }}
+        onClick={() => {
+          if (active) return;
+          setOpen((value) => {
+            if (value) setShowAll(false);
+            return !value;
+          });
+        }}
       >
         {active && <LoaderCircle className="spin work-log-spinner" size={14} aria-hidden="true" />}
         <span aria-live="polite">
@@ -1473,13 +1555,34 @@ function WorkLog({
       {expanded && (
         <div className="work-log-content">
           <div className="work-timeline">
-            {timeline.map(({ message, item, key }) => {
+            {canCompact && (showAll || hiddenCount > 0) && (
+              <button
+                type="button"
+                className="work-history-toggle"
+                aria-expanded={showAll}
+                onClick={() => setShowAll((value) => !value)}
+              >
+                <History size={13} />
+                <span>{showAll ? t("work.showRecentOnly") : t("work.showEarlier", { count: hiddenCount })}</span>
+              </button>
+            )}
+            {displayTimeline.map((displayEntry) => {
+              if (displayEntry.type === "tool-group") return (
+                <ToolGroup
+                  key={displayEntry.key}
+                  kind={displayEntry.kind}
+                  entries={displayEntry.entries}
+                  onPreviewFile={onPreviewFile}
+                />
+              );
+              const { message, item, key } = displayEntry.entry;
               if (item.type === "thinking") return (
                 <ReasoningBlock
                   key={key}
                   text={item.text}
                   active={active && key === latestWorkKey}
                   autoExpand={showReasoningProcess}
+                  onPreviewFile={onPreviewFile}
                 />
               );
               if (item.type === "text") return <MarkdownContent key={key} text={item.text} className="work-text markdown-body" onPreviewFile={onPreviewFile} />;
@@ -1493,7 +1596,17 @@ function WorkLog({
   );
 }
 
-function ReasoningBlock({ text, active, autoExpand }: { text: string; active: boolean; autoExpand: boolean }) {
+function ReasoningBlock({
+  text,
+  active,
+  autoExpand,
+  onPreviewFile,
+}: {
+  text: string;
+  active: boolean;
+  autoExpand: boolean;
+  onPreviewFile(filePath: string): void;
+}) {
   const { t } = useI18n();
   const [open, setOpen] = useState(active && autoExpand);
   const previousAutoExpand = useRef(autoExpand);
@@ -1510,7 +1623,7 @@ function ReasoningBlock({ text, active, autoExpand }: { text: string; active: bo
         <span>{t("work.reasoning")}</span>
         <ChevronDown className="reasoning-chevron" size={13} />
       </button>
-      {open && <p>{text}</p>}
+      {open && <MarkdownContent text={text} className="reasoning-content markdown-body" onPreviewFile={onPreviewFile} />}
     </div>
   );
 }
@@ -1645,13 +1758,7 @@ function ToolRow({ tool, onPreviewFile }: { tool: ToolActivity; onPreviewFile?(f
   const filePath = toolFilePath(tool);
   const toolName = tool.name.toLowerCase();
   const plan = toolName === "update_plan" ? parseStructuredPlan(tool.args) : undefined;
-  const Icon = toolName.includes("exec") || toolName.includes("bash") || toolName.includes("command")
-    ? TerminalSquare
-    : toolName.includes("plan")
-      ? ListTodo
-      : toolName.includes("search")
-        ? Search
-        : FileCode2;
+  const Icon = toolIcon(toolName);
 
   return (
     <div className={`tool-entry ${open ? "open" : ""}`}>
@@ -1662,7 +1769,7 @@ function ToolRow({ tool, onPreviewFile }: { tool: ToolActivity; onPreviewFile?(f
           aria-expanded={hasDetails ? open : undefined}
           aria-label={hasDetails ? t(open ? "work.hideDetails" : "work.showDetails", { tool: toolDisplayTitle(tool, t) }) : undefined}
         >
-          <span className={`tool-state ${tool.status}`}>{tool.status === "running" ? <LoaderCircle className="spin" size={13} /> : tool.status === "error" ? <CircleAlert size={13} /> : <Check size={13} />}</span>
+          <ToolState status={tool.status} />
           <Icon size={14} />
           <span>{toolDisplayTitle(tool, t)}</span>
           {hasDetails && <ChevronDown className="tool-chevron" size={13} />}
@@ -1685,6 +1792,73 @@ function ToolRow({ tool, onPreviewFile }: { tool: ToolActivity; onPreviewFile?(f
   );
 }
 
+function ToolGroup({
+  kind,
+  entries,
+  onPreviewFile,
+}: {
+  kind: ToolKind;
+  entries: ResolvedToolEntry[];
+  onPreviewFile?(filePath: string): void;
+}) {
+  const { t } = useI18n();
+  const running = entries.some((entry) => entry.tool.status === "running");
+  const [open, setOpen] = useState(running);
+  const status = running
+    ? "running"
+    : entries.some((entry) => entry.tool.status === "error")
+      ? "error"
+      : "complete";
+  const Icon = toolIcon(entries[0]!.tool.name.toLowerCase());
+  const title = toolGroupTitle(kind, entries, t);
+
+  useEffect(() => {
+    if (running) setOpen(true);
+  }, [running]);
+
+  return (
+    <div className={`tool-group ${open ? "open" : ""}`}>
+      <button
+        type="button"
+        className="tool-row tool-group-summary"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ToolState status={status} />
+        <Icon size={14} />
+        <span>{title}</span>
+        <ChevronDown className="tool-chevron" size={13} />
+      </button>
+      {open && (
+        <div className="tool-group-children">
+          {entries.map((entry) => (
+            <ToolRow key={entry.key} tool={entry.tool} onPreviewFile={onPreviewFile} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolState({ status }: { status: ToolActivity["status"] }) {
+  return (
+    <span className={`tool-state ${status}`}>
+      {status === "running"
+        ? <LoaderCircle className="spin" size={13} />
+        : status === "error"
+          ? <CircleAlert size={13} />
+          : <Check size={13} />}
+    </span>
+  );
+}
+
+function toolIcon(toolName: string) {
+  if (toolName.includes("exec") || toolName.includes("bash") || toolName.includes("command")) return TerminalSquare;
+  if (toolName.includes("plan")) return ListTodo;
+  if (toolName.includes("search")) return Search;
+  return FileCode2;
+}
+
 function ProfileAvatar({ profile, className }: { profile: UserProfile; className: string }) {
   return (
     <span className={className} aria-hidden="true">
@@ -1696,6 +1870,7 @@ function ProfileAvatar({ profile, className }: { profile: UserProfile; className
 }
 
 function SettingsDialog(props: {
+  initialSection: SettingsSection;
   providers: ProviderStatus[];
   provider: ProviderId;
   permission: PermissionMode;
@@ -1720,7 +1895,7 @@ function SettingsDialog(props: {
   onToast(message: string, type?: "info" | "error"): void;
 }) {
   const { language, setLanguage, t } = useI18n();
-  const [section, setSection] = useState<"general" | "personalization" | "models" | "agent" | "appearance" | "about">("general");
+  const [section, setSection] = useState<SettingsSection>(props.initialSection);
   const [selected, setSelected] = useState<ProviderId>(props.provider);
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("https://api.deepseek.com");
@@ -2721,6 +2896,18 @@ function toolDisplayTitle(tool: ToolActivity, t: Translator): string {
   return tool.name.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
 }
 
+function toolGroupTitle(kind: ToolKind, entries: ResolvedToolEntry[], t: Translator): string {
+  const count = entries.length;
+  if (kind === "command") return t("work.groupCommands", { count });
+  if (kind === "edit") return t("work.groupEdits", { count });
+  if (kind === "plan") return t("work.groupPlans", { count });
+  if (kind === "read") return t("work.groupReads", { count });
+  if (kind === "search") return t("work.groupSearches", { count });
+  if (kind === "write") return t("work.groupWrites", { count });
+  const tool = entries[0]!.tool.name.replaceAll("_", " ");
+  return t("work.groupToolCalls", { count, tool });
+}
+
 function toolFilePath(tool: ToolActivity): string | undefined {
   const name = tool.name.toLowerCase();
   if (!["read", "write", "edit", "patch", "file", "image"].some((part) => name.includes(part))) return undefined;
@@ -2761,6 +2948,10 @@ function crop(value: string, length: number): string {
   return singleLine.length > length ? `${singleLine.slice(0, length - 1)}…` : singleLine;
 }
 
+function conversationError(value: string): string {
+  return value.replace(/^Error invoking remote method '[^']+':\s*/i, "").trim();
+}
+
 function cleanError(value: string): string {
-  return value.replace(/^Error invoking remote method '[^']+':\s*/i, "").split("\n").filter(Boolean).slice(0, 3).join(" ");
+  return conversationError(value).split("\n").filter(Boolean).slice(0, 3).join(" ");
 }

@@ -80,8 +80,18 @@ Download published installers from [DSCode Releases](https://github.com/thinkany
 Choose the DMG matching your Mac (`arm64` for Apple Silicon or `x64` for Intel), the `-setup.exe` for
 Windows, or the DEB/RPM package for Linux.
 
-DSCode credentials, settings, project trust, and sessions remain in `~/.dscode`, shared with the
-terminal client. The Electron main process starts the bundled core RPC entry with Electron's own
+Packaged DSCode keeps credentials, settings, project trust, and sessions in `~/.dscode`, shared with
+the terminal client. Unpackaged development builds use `~/.dscode-dev`. Electron settings, recent
+workspaces, tasks, caches, and logs use separate `DSCode` and `DSCode Dev` directories under the OS
+application data directory. Development builds do not import production data. Explicit
+`DSCODE_HOME` and `DSCODE_DESKTOP_USER_DATA` overrides are supported for isolated test runs.
+
+Desktop builds always use file credential storage (`auth.json`, owner-only permissions), so neither
+the main process nor its RPC child accesses the system keyring or prompts for keychain permission.
+Credentials previously saved only in the keyring must be entered again; they are not automatically
+read or migrated. The terminal client's credential storage policy is unchanged.
+
+The Electron main process starts the bundled core RPC entry with Electron's own
 Node runtime, so packaged builds do not require a separate system `node` executable.
 
 On Windows and Linux, restricted tool execution currently requires a trusted Docker sandbox image
